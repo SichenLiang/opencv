@@ -315,7 +315,10 @@ int TExpr::emitBinary(TOp op, int a, int b, int rdepth, const Scalar& params)
     // addWeighted a*alpha + b*beta + gamma (params = {alpha, beta, gamma}): ONE fused kernel (two v_fma).
     // Inputs are the same type T (cast to a common type if not). The kernel outputs T/f32 (small ints,
     // f16/bf16, f32) or f64 directly; for any other requested rdepth it computes in the work type W and a
-    // final cast narrows it.
+    // final cast converts it. W is the work type of T's kernels - f32 for the 8/16-bit, f16/bf16 and f32
+    // group, f64 for the 32-bit-int and 64-bit group - and depends on T only, NOT on rdepth: a small
+    // type has no T -> f64 kernel, so its 64F result is computed in f32 and widened by the cast, the
+    // same way multiply() produces a 64F result from these types (#29880).
     if (op == OP_ADDW)
     {
         int Tt = arginfo[a].depth;
@@ -329,9 +332,9 @@ int TExpr::emitBinary(TOp op, int a, int b, int rdepth, const Scalar& params)
         int outD = rdepth;
         if (!k.fptr)                                          // no direct T->rdepth kernel: compute in W, cast
         {
-            outD = (Tt==CV_32U || Tt==CV_32S || Tt==CV_64U || Tt==CV_64S || Tt==CV_64F || rdepth==CV_64F)
-                 ? CV_64F : CV_32F;
+            outD = (Tt==CV_32U || Tt==CV_32S || Tt==CV_64U || Tt==CV_64S || Tt==CV_64F) ? CV_64F : CV_32F;
             k = getElemwiseFunc(OP_ADDW, Tt, Tt, EW_DEPTH_NONE, outD);
+            CV_Assert(k.fptr && "ew: no kernel for this op/type combination");   // CV_Bool / fp8 inputs
         }
         const int out = addTemp(outD);
         addInsn(OP_ADDW, a, b, 0, out, k, Scalar(params[0], params[1], params[2]));
@@ -1007,9 +1010,11 @@ int TExpr::typedConstFrom(int srcSlot, int depth)
 }
 
 // Append one instruction with a pre-resolved kernel (the caller probed getElemwiseFunc, or knows
-// the kernel - e.g. div's /0-aware kernel). No re-resolution.
+// the kernel - e.g. div's /0-aware kernel). No re-resolution, but never store a null kernel: runInsn
+// calls fptr unconditionally, so a missing kernel must fail here, not as a null call at exec time.
 int TExpr::addInsn(TOp op, int a0, int a1, int a2, int result, const TKernel& kernel, const Scalar& params)
 {
+    CV_Assert(kernel.fptr && "ew: no kernel for this op/type combination");
     TExpr::Insn ins; ins.op = op; ins.arg0 = a0; ins.arg1 = a1; ins.arg2 = a2; ins.result = result;
     ins.params = params; ins.kernel = kernel;
     prog.push_back(ins);

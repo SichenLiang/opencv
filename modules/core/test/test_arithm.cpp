@@ -1967,6 +1967,57 @@ INSTANTIATE_TEST_CASE_P(Core_RecipMixed, ArithmMixedTest,
                                                              std::tuple<cvtest::MatDepth, cvtest::MatDepth>{CV_8S, CV_32F}),
                                            ::testing::Values(1, 3, 4)));
 
+// addWeighted with dtype=CV_64F from the inputs whose kernels only emit T or f32 (8U/8S/16U/16S/16F/16BF/32F):
+// there is no direct T -> f64 kernel, so the engine computes in f32 and widens with a cast. It used to bind
+// a null kernel pointer and crash (https://github.com/opencv/opencv/issues/29880). The reference is the
+// exact double formula; the tolerance is that of an f32 evaluation with f32-rounded coefficients (about
+// 3*2^-24 of the sum of the three terms, rounded up to 1e-6), relative to the magnitude of those terms
+// (the result itself may cancel to ~0).
+TEST(Core_AddWeighted, regression_29880_small_types_to_64F)
+{
+    const int depths[] = { CV_8U, CV_8S, CV_16U, CV_16S, CV_16F, CV_16BF, CV_32F };
+    RNG rng((uint64)ARITHM_RNG_SEED);
+    for (int depth : depths)
+        for (int cn = 1; cn <= ARITHM_MAX_CHANNELS; cn++)
+            for (int iter = 0; iter < 10; iter++)
+            {
+                vector<int> size;
+                cvtest::randomSize(rng, 2, ARITHM_MAX_NDIMS, ARITHM_MAX_SIZE_LOG, size);
+                const double minval = depth < CV_32S ? cvtest::getMinVal(depth) : -1000.;
+                const double maxval = depth < CV_32S ? cvtest::getMaxVal(depth) : 1000.;
+                const int type = CV_MAKETYPE(depth, cn);
+                Mat a = cvtest::randomMat(rng, size, type, minval, maxval, true);
+                Mat b = cvtest::randomMat(rng, size, type, minval, maxval, true);
+                const double alpha = rng.uniform(-3., 3.), beta = rng.uniform(-3., 3.);
+                const double gamma = rng.uniform(-1000., 1000.);
+
+                Mat dst, ref;
+                cv::addWeighted(a, alpha, b, beta, gamma, dst, CV_64F);
+                ASSERT_EQ(CV_MAKETYPE(CV_64F, cn), dst.type());
+                cvtest::add(a, alpha, b, beta, Scalar::all(gamma), ref, CV_64F);
+
+                const double absmax = std::max(fabs(minval), fabs(maxval));
+                const double tol = (fabs(alpha)*absmax + fabs(beta)*absmax + fabs(gamma))*1e-6;
+                EXPECT_LE(cvtest::norm(dst, ref, NORM_INF), tol)
+                    << "depth=" << depth << " cn=" << cn << " alpha=" << alpha << " beta=" << beta
+                    << " gamma=" << gamma << "\nsrc ~ " << cvtest::MatInfo(a) << "\niteration #" << iter;
+            }
+}
+
+// CV_Bool and the fp8 depths have no element-wise arithmetic kernels; like add() and multiply(),
+// addWeighted() must reject them with an exception instead of crashing on a null kernel
+// (https://github.com/opencv/opencv/issues/29880).
+TEST(Core_AddWeighted, regression_29880_unsupported_input_types)
+{
+    for (int sdepth : { CV_Bool, CV_8F_E4M3FN, CV_8F_E4M3FNUZ })
+    {
+        Mat a(4, 4, CV_MAKETYPE(sdepth, 1), Scalar::all(1)), b = a.clone(), dst;
+        for (int dtype : { -1, CV_8U, CV_32F, CV_64F, CV_Bool })
+            EXPECT_THROW(cv::addWeighted(a, 0.5, b, 0.5, 1.0, dst, dtype), cv::Exception)
+                << "sdepth=" << sdepth << " dtype=" << dtype;
+    }
+}
+
 TEST(Core_ArithmMask, uninitialized)
 {
     RNG& rng = theRNG();
